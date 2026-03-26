@@ -1,0 +1,292 @@
+name: Build Kernel with KernelSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU variant to integrate'
+        required: true
+        default: 'sukisu-ultra'
+        type: choice
+        options:
+          - sukisu-ultra
+          - kernelsu-next
+      verbose_build:
+        description: 'Enable verbose build output (V=1) for debugging'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  KERNEL_SOURCE: https://github.com/LineageOS/android_kernel_oneplus_sm4350
+  KERNEL_BRANCH: lineage-23.2
+  DEFCONFIG: vendor/holi-qgki_defconfig
+  ARCH: arm64
+  KERNEL_DIR: kernel_source
+
+jobs:
+  build:
+    name: Build Kernel (${{ github.event.inputs.ksu_variant }})
+    runs-on: ubuntu-22.04
+
+    steps:
+
+    # ── Checkout this repo (contains scripts, anykernel config) ──────────────
+    - name: Checkout scripts repo
+      uses: actions/checkout@v4
+
+    # ── Build dependencies ────────────────────────────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ccache curl flex git zip unzip \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+          binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi \
+          clang lld llvm \
+          libssl-dev libelf-dev libncurses-dev python3
+
+        echo "── Toolchain versions ──────────────────────────────────────────"
+        clang --version | head -1
+        aarch64-linux-gnu-gcc --version | head -1
+        python3 --version
+
+    # ── ccache speeds up re-runs dramatically ─────────────────────────────────
+    - name: Setup ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        max-size: 3G
+        key: kernel-${{ github.event.inputs.ksu_variant }}-${{ env.KERNEL_BRANCH }}
+        restore-keys: |
+          kernel-${{ github.event.inputs.ksu_variant }}-
+          kernel-
+
+    # ── Clone kernel source ───────────────────────────────────────────────────
+    - name: Clone kernel source
+      run: |
+        echo ":: Cloning LineageOS kernel (depth=1, branch ${{ env.KERNEL_BRANCH }})..."
+        git clone --depth=1 \
+          -b ${{ env.KERNEL_BRANCH }} \
+          ${{ env.KERNEL_SOURCE }} \
+          ${{ env.KERNEL_DIR }}
+
+        echo ""
+        echo "── Kernel version ───────────────────────────────────────────────"
+        head -5 ${{ env.KERNEL_DIR }}/Makefile
+        echo "── Disk usage after clone ───────────────────────────────────────"
+        du -sh ${{ env.KERNEL_DIR }}
+
+    # ── KernelSU Setup (SukiSU Ultra) ─────────────────────────────────────────
+    - name: Setup SukiSU Ultra
+      if: github.event.inputs.ksu_variant == 'sukisu-ultra'
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        echo ":: Running SukiSU Ultra setup script..."
+        curl -LSs \
+          "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+          | bash -s main
+
+        echo ""
+        echo "── KSU directory contents ───────────────────────────────────────"
+        ls KernelSU/
+
+        echo ""
+        echo "── KSU version (this must NOT be a huge number like 2839...) ────"
+        cd KernelSU && git describe --tags --always 2>/dev/null || echo "WARNING: could not determine version"
+
+        echo ""
+        echo "── Kbuild integration check ─────────────────────────────────────"
+        grep -n "kernelsu" ${{ env.KERNEL_DIR }}/drivers/Makefile || echo "WARNING: KSU not found in drivers/Makefile"
+        grep -n "kernelsu" ${{ env.KERNEL_DIR }}/drivers/Kconfig  || echo "WARNING: KSU not found in drivers/Kconfig"
+
+    # ── KernelSU Setup (KernelSU Next) ────────────────────────────────────────
+    - name: Setup KernelSU Next
+      if: github.event.inputs.ksu_variant == 'kernelsu-next'
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        echo ":: Running KernelSU Next setup script (dev branch)..."
+        curl -LSs \
+          "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" \
+          | bash -s dev
+
+        echo ""
+        echo "── KSU directory contents ───────────────────────────────────────"
+        ls KernelSU/
+
+        echo ""
+        echo "── KSU version ──────────────────────────────────────────────────"
+        cd KernelSU && git describe --tags --always 2>/dev/null || echo "WARNING: could not determine version"
+
+        echo ""
+        echo "NOTE: For KernelSU Next you MUST use the official manager APK"
+        echo "      from the same branch/commit as this kernel build."
+        echo "      Mismatched APKs cause the 'signature not found' error."
+
+    # ── Apply manual hooks ────────────────────────────────────────────────────
+    - name: Apply KernelSU hooks to kernel source
+      run: |
+        echo ":: Patching kernel source with KernelSU hooks..."
+        python3 ${{ github.workspace }}/scripts/apply_ksu_hooks.py \
+          ${{ github.workspace }}/${{ env.KERNEL_DIR }}
+
+        echo ""
+        echo ":: Verifying hooks were applied..."
+        python3 ${{ github.workspace }}/scripts/apply_ksu_hooks.py \
+          ${{ github.workspace }}/${{ env.KERNEL_DIR }} --verify
+
+    # ── Configure kernel ──────────────────────────────────────────────────────
+    - name: Configure kernel
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        mkdir -p out
+
+        echo ":: Generating .config from ${{ env.DEFCONFIG }}..."
+        make -j$(nproc) \
+          O=out \
+          ARCH=${{ env.ARCH }} \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          ${{ env.DEFCONFIG }}
+
+        echo ""
+        echo ":: Enabling CONFIG_KSU and CONFIG_OVERLAY_FS..."
+        scripts/config --file out/.config \
+          -e CONFIG_KSU \
+          -e CONFIG_OVERLAY_FS
+
+        # Resolve any new config prompts with defaults
+        make -j$(nproc) \
+          O=out \
+          ARCH=${{ env.ARCH }} \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          olddefconfig
+
+        echo ""
+        echo "── KSU-related config entries ───────────────────────────────────"
+        grep -E "^(CONFIG_KSU|CONFIG_OVERLAY_FS|CONFIG_LTO_CLANG|CONFIG_THINLTO)" out/.config \
+          || echo "  (none of the above found)"
+
+    # ── Build ─────────────────────────────────────────────────────────────────
+    - name: Build kernel
+      run: |
+        cd ${{ env.KERNEL_DIR }}
+        export PATH="/usr/lib/ccache:$PATH"
+
+        # Optional verbose flag
+        VERBOSE_FLAG=""
+        if [ "${{ github.event.inputs.verbose_build }}" = "true" ]; then
+          VERBOSE_FLAG="V=1"
+          echo ":: Verbose build enabled"
+        fi
+
+        echo ":: Starting build with $(nproc) threads..."
+        BUILD_START=$(date +%s)
+
+        make -j$(nproc) $VERBOSE_FLAG \
+          O=out \
+          ARCH=${{ env.ARCH }} \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          LD=ld.lld \
+          AR=llvm-ar \
+          NM=llvm-nm \
+          OBJCOPY=llvm-objcopy \
+          OBJDUMP=llvm-objdump \
+          STRIP=llvm-strip \
+          Image dtbs 2>&1 | tee build.log
+
+        BUILD_END=$(date +%s)
+        echo ""
+        echo "── Build time: $(( (BUILD_END - BUILD_START) / 60 ))m $(( (BUILD_END - BUILD_START) % 60 ))s"
+
+    # ── Sanity check output ───────────────────────────────────────────────────
+    - name: Verify kernel image and KSU integration
+      run: |
+        IMAGE="${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image"
+
+        if [ ! -f "$IMAGE" ]; then
+          echo "ERROR: Kernel Image not found!"
+          echo "Files in boot dir:"
+          find ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/ -type f 2>/dev/null || true
+          exit 1
+        fi
+        echo "✓ Kernel Image found: $(ls -lh $IMAGE)"
+
+        # Check System.map for KSU symbols — proves KSU is compiled in
+        SYSMAP="${{ env.KERNEL_DIR }}/out/System.map"
+        if [ -f "$SYSMAP" ]; then
+          KSU_COUNT=$(grep -c "ksu_" "$SYSMAP" 2>/dev/null || echo 0)
+          if [ "$KSU_COUNT" -gt 0 ]; then
+            echo "✓ KernelSU symbols in System.map: $KSU_COUNT entries"
+            grep "ksu_" "$SYSMAP" | head -10
+          else
+            echo "✗ WARNING: No KernelSU symbols in System.map"
+            echo "  This means KSU was not compiled in or CONFIG_KSU was not set."
+            echo "  Check that hooks were applied and CONFIG_KSU=y is in .config"
+          fi
+        fi
+
+        # Also confirm ksud-related paths in kallsyms (if available)
+        echo ""
+        echo "── Key KSU functions in System.map ─────────────────────────────"
+        grep -E "ksu_handle_execveat|ksu_handle_faccessat|ksu_handle_vfs_read" \
+          "$SYSMAP" 2>/dev/null || echo "  (not found — check hook application)"
+
+    # ── Package with AnyKernel3 ───────────────────────────────────────────────
+    - name: Package with AnyKernel3
+      run: |
+        echo ":: Cloning AnyKernel3..."
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3_base
+
+        # Build package directory
+        mkdir -p package
+        cp -r ak3_base/tools  package/
+        cp -r ak3_base/META-INF package/
+        cp ${{ github.workspace }}/anykernel/anykernel.sh package/anykernel.sh
+
+        # Kernel image
+        cp ${{ env.KERNEL_DIR }}/out/arch/arm64/boot/Image package/
+        echo "✓ Kernel Image copied"
+
+        # DTBO (optional but important for hardware features on holi)
+        DTBO="${{ env.KERNEL_DIR }}/out/arch/arm64/boot/dtbo.img"
+        if [ -f "$DTBO" ]; then
+          cp "$DTBO" package/
+          echo "✓ dtbo.img included"
+        else
+          echo "  dtbo.img not found — skipping (may be fine)"
+        fi
+
+        # Build flashable zip
+        VARIANT="${{ github.event.inputs.ksu_variant }}"
+        DATE=$(date +%Y%m%d-%H%M)
+        ZIP_NAME="NordN200-KSU-${VARIANT}-${DATE}.zip"
+
+        cd package
+        zip -r9 ${{ github.workspace }}/${ZIP_NAME} . \
+          -x "*.git*" -x "*.md" -x "LICENSE" -x "*.bak"
+        cd ${{ github.workspace }}
+
+        echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+        echo "✓ Package: $(ls -lh ${ZIP_NAME})"
+
+    # ── Upload artifacts ──────────────────────────────────────────────────────
+    - name: Upload flashable zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ZIP_NAME }}
+        path: ${{ github.workspace }}/${{ env.ZIP_NAME }}
+        retention-days: 30
+
+    - name: Upload build log (always, for diagnostics)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log
+        path: ${{ env.KERNEL_DIR }}/build.log
+        retention-days: 7
